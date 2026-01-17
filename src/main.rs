@@ -1,58 +1,41 @@
+mod config;
+mod error;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
-use std::{env, fs};
 
-use ureq::Agent;
+use crate::{config::Config, error::Error};
 
 const ENDPOINT: &str = "https://api.porkbun.com/api/json/v3";
 const ENDPOINT_IPV4: &str = "https://api-ipv4.porkbun.com/api/json/v3";
 
-fn main() {
-    let config_path = Path::new("config.toml");
-    let config: Config = match config_path.exists() {
-        true => {
-            let data = fs::read_to_string(config_path).unwrap();
-            toml::from_str(&data).unwrap()
-        }
-        false => {
-            let data = toml::to_string_pretty(&Config::default()).unwrap();
-            fs::write(config_path, data).unwrap();
-            return;
-        }
-    };
+fn main() -> Result<(), Error> {
+    let mut config = Config::read()?;
+    if config.keys.is_none() {
+        config.env_keys()?;
+    }
 
-    let agent = Agent::new();
+    let agent = ureq::agent();
 
-    let keys = match config.keys {
-        Some(x) => x,
-        None => get_env().expect("Couldn't get environment variables"),
-    };
-
-    let ip: String;
     let endpoint: &str = match config.ip.ipv6 {
         true => ENDPOINT,
         false => ENDPOINT_IPV4,
     };
-    match config.ip.address.is_empty() {
+    let ip = match config.ip.address.is_empty() {
         true => {
             let ping_response: Value = agent
                 .post(&format!("{}/ping", endpoint))
-                .send_json(&keys)
-                .unwrap()
-                .into_json()
-                .unwrap();
+                .send_json(config.try_keys())?
+                .into_body()
+                .read_json()?;
             if let Some(x) = ping_response["yourIp"].as_str() {
-                ip = String::from(x);
+                x.to_owned()
             } else {
-                println!("Couldn't retrieve IP address.");
-                return;
+                return Err(Error::NoIp);
             }
         }
-        false => {
-            ip = config.ip.address;
-        }
-    }
+        false => config.ip.address.clone(),
+    };
 
     let full_domain = match config.domain.subdomain.is_empty() {
         true => config.domain.base.clone(),
@@ -76,16 +59,14 @@ fn main() {
     );
     let records_response: RecordsResponse = agent
         .post(&records_endpoint)
-        .send_json(&keys)
-        .unwrap()
-        .into_json()
-        .unwrap();
+        .send_json(config.try_keys())?
+        .into_body()
+        .read_json()?;
     if records_response.status.as_str() != "SUCCESS" {
-        println!("Couldn't retrieve records");
-        return;
+        return Err(Error::NoRecords);
     }
 
-    let record = records_response.records.get(0);
+    let record = records_response.records.first();
 
     if let Some(x) = record {
         if x.content == ip {
@@ -93,20 +74,21 @@ fn main() {
                 "Existing {} record already matches answer {}",
                 record_type, &ip
             );
-            return;
+            return Ok(());
         }
         let delete_endpoint = format!("{}/dns/delete/{}/{}", endpoint, &config.domain.base, x.id);
         let delete_response: Value = agent
             .post(&delete_endpoint)
-            .send_json(&keys)
-            .unwrap()
-            .into_json()
-            .unwrap();
-        if delete_response["status"].as_str().is_some() {
+            .send_json(config.try_keys())?
+            .into_body()
+            .read_json()?;
+        if delete_response["status"]
+            .as_str()
+            .is_some_and(|x| x == "SUCCESS")
+        {
             println!("Deleting existing {} record", &record_type);
         } else {
-            println!("Couldn't delete record.");
-            return;
+            return Err(Error::Delete);
         }
         ttl = x.ttl.clone();
         prio = x.prio.clone();
@@ -117,59 +99,29 @@ fn main() {
 
     let create_endpoint = format!("{}/dns/create/{}", endpoint, &config.domain.base);
     let create_body = CreateRecord {
-        secretapikey: keys.secretapikey,
-        apikey: keys.apikey,
+        secretapikey: config.try_keys().secretapikey.clone(),
+        apikey: config.try_keys().apikey.clone(),
         name: config.domain.subdomain,
         _type: String::from(record_type),
-        content: String::from(&ip),
+        content: ip.to_string(),
         ttl,
         prio,
         notes,
     };
     let create_response: Value = agent
         .post(&create_endpoint)
-        .send_json(create_body)
-        .unwrap()
-        .into_json()
-        .unwrap();
-    match create_response["status"].as_str() {
-        Some("SUCCESS") => {
-            println!("Creating record: {} with answer of {}", &full_domain, &ip)
-        }
-        _ => {
-            println!("Couldn't create record.")
-        }
+        .send_json(create_body)?
+        .into_body()
+        .read_json()?;
+    if create_response["status"]
+        .as_str()
+        .is_some_and(|x| x == "SUCCESS")
+    {
+        println!("Creating record: {} with answer of {}", &full_domain, &ip);
+        Ok(())
+    } else {
+        Err(Error::Create)
     }
-}
-
-fn get_env() -> Result<Keys, env::VarError> {
-    Ok(Keys {
-        secretapikey: env::var("PORKBUN_SECRET_API_KEY")?,
-        apikey: env::var("PORKBUN_API_KEY")?,
-    })
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct Config {
-    keys: Option<Keys>,
-    domain: Domain,
-    ip: Ip,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct Keys {
-    secretapikey: String,
-    apikey: String,
-}
-#[derive(Serialize, Deserialize, Default)]
-struct Domain {
-    subdomain: String,
-    base: String,
-}
-#[derive(Serialize, Deserialize, Default)]
-struct Ip {
-    address: String,
-    ipv6: bool,
 }
 
 #[derive(Deserialize)]
